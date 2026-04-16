@@ -99,7 +99,7 @@
 
 ```
 Jarvice-Ai/
-├── client/                   
+├── client/                    
 │   ├── src/
 │   │   ├── components/      
 │   │   ├── contexts/       
