@@ -84,7 +84,7 @@ async function testSaveVoiceSession() {
 
 async function testGetVoiceHistory() {
   try {
-    console.log('\n📚 Testing: GET /api/interview/voice-history');
+    console.log('\n Testing: GET /api/interview/voice-history');
     
     const response = await axios.get(
       `${BASE_URL}/api/interview/voice-history?page=1&limit=10`,
@@ -95,7 +95,7 @@ async function testGetVoiceHistory() {
       }
     );
     
-    console.log('✅ Voice history retrieved successfully');
+    console.log(' Voice history retrieved successfully');
     console.log(`   Total sessions: ${response.data.pagination.total}`);
     console.log(`   Sessions on page: ${response.data.sessions.length}`);
     

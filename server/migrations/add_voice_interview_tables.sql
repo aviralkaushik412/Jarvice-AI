@@ -1,4 +1,3 @@
--- Add voice_mode column to interview_sessions table if it doesn't exist
 DO $$
 BEGIN
   IF NOT EXISTS (

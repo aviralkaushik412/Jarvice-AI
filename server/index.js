@@ -6,6 +6,7 @@ const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const { connectDB } = require('./config/database');
+const { verifyEmailTransport } = require('./utils/email');
 const authRoutes = require('./routes/auth');
 const chatRoutes = require('./routes/chat');
 const interviewRoutes = require('./routes/interview');
@@ -14,9 +15,9 @@ const imageRoutes = require('./routes/image');
 const userRoutes = require('./routes/user');
 
 const app = express();
-const { verifyEmailTransport } = require('./utils/email');
 
 connectDB();
+verifyEmailTransport();
 
 app.use(helmet());
 

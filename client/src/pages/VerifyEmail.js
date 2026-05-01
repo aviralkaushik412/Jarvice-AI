@@ -8,7 +8,7 @@ import toast from 'react-hot-toast';
 const VerifyEmail = () => {
   const { token } = useParams();
   const navigate = useNavigate();
-  const [status, setStatus] = useState('verifying'); // verifying, success, error
+  const [status, setStatus] = useState('verifying'); 
   const [message, setMessage] = useState('');
 
   useEffect(() => {
@@ -27,7 +27,6 @@ const VerifyEmail = () => {
       setMessage(response.data.message);
       toast.success('Email verified successfully!');
       
-      // Redirect to dashboard after 3 seconds
       setTimeout(() => {
         navigate('/dashboard');
       }, 3000);

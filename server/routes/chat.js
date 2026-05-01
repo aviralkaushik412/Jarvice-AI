@@ -1,10 +1,25 @@
 const express = require('express');
 const axios = require('axios');
+const { GoogleGenAI } = require('@google/genai');
 const { body, validationResult } = require('express-validator');
 const { pool } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+// Match @google/genai docs / voice stack; override with GEMINI_MODEL in .env
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+let geminiClient = null;
+const getGeminiClient = () => {
+  if (!GEMINI_API_KEY) {
+    return null;
+  }
+  if (!geminiClient) {
+    geminiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+  }
+  return geminiClient;
+};
 
 router.post('/send', [
   authenticateToken,
@@ -19,11 +34,11 @@ router.post('/send', [
     const { message } = req.body;
     const userId = req.user.id;
 
-    console.log('📨 Received message from user', userId, ':', message);
+    console.log('Received message from user', userId, ':', message);
 
     const geminiResponse = await callGeminiAPI(message);
 
-    console.log('✅ Gemini response received:', geminiResponse.substring(0, 100) + '...');
+    console.log('Gemini response received:', geminiResponse.substring(0, 100) + '...');
 
     await pool.query(
       'INSERT INTO chats (user_id, message, response) VALUES ($1, $2, $3)',
@@ -93,55 +108,55 @@ router.delete('/history', authenticateToken, async (req, res) => {
   }
 });
 
+const CHAT_SYSTEM_PREFIX = `You are Jarvice AI, an intelligent assistant specialized in interview preparation and career guidance.
+You help users with:
+- Interview questions and answers
+- Resume and CV advice
+- Career development tips
+- Mock interview practice
+- Industry-specific guidance
+
+Be helpful, professional, and encouraging. Keep responses concise but informative.
+
+User message:`;
+
 const callGeminiAPI = async (message) => {
   try {
-    console.log('🔄 Calling Gemini API...');
-    const response = await axios.post(
-      `${process.env.GEMINI_API_URL}?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [{
-          parts: [{
-            text: `You are Jarvice AI, an intelligent assistant specialized in interview preparation and career guidance. 
-                   You help users with:
-                   - Interview questions and answers
-                   - Resume and CV advice
-                   - Career development tips
-                   - Mock interview practice
-                   - Industry-specific guidance
-                   
-                   Be helpful, professional, and encouraging. Keep responses concise but informative.
-                   
-                   User message: ${message}`
-          }]
-        }],
-        generationConfig: {
-          temperature: 0.7,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 1024,
-        }
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        timeout: 30000
-      }
-    );
-
-    if (response.data && response.data.candidates && response.data.candidates[0]) {
-      console.log('✅ Gemini API response received');
-      return response.data.candidates[0].content.parts[0].text;
-    } else {
-      throw new Error('Invalid response from Gemini API');
+    const ai = getGeminiClient();
+    if (!ai) {
+      throw new Error('Missing GEMINI_API_KEY (or GOOGLE_API_KEY) in environment');
     }
+
+    console.log('🔄 Calling Gemini API (SDK)...', { model: GEMINI_MODEL });
+    const response = await ai.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: `${CHAT_SYSTEM_PREFIX}\n${message}`,
+      config: {
+        temperature: 0.7,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 1024
+      }
+    });
+
+    const resolved = response.text && String(response.text).trim();
+    if (resolved) {
+      console.log('✅ Gemini API response received');
+      return resolved;
+    }
+    throw new Error('Empty or blocked response from Gemini API');
   } catch (geminiError) {
     console.error('❌ Gemini API error:', geminiError.message);
-    if (geminiError.response) {  
+    if (geminiError.response) {
       console.error('API Response:', geminiError.response.data);
     }
-    
-    if (process.env.OPENAI_API_KEY) {
+    if (geminiError.cause) {
+      console.error('Cause:', geminiError.cause);
+    }
+
+    const openaiFallback =
+      process.env.OPENAI_FALLBACK_ENABLED !== 'false' && process.env.OPENAI_API_KEY;
+    if (openaiFallback) {
       try {
         console.log('🔄 Falling back to OpenAI API...');
         return await callOpenAIAPI(message);
@@ -161,16 +176,11 @@ Please try again in a moment, or feel free to ask me specific questions about yo
   }
 };
 
+const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini';
+
 const callOpenAIAPI = async (message) => {
   try {
-    const response = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-3.5-turbo',
-        messages: [
-          {
-            role: 'system',
-            content: `You are Jarvice AI, an intelligent assistant specialized in interview preparation and career guidance. 
+    const systemPrompt = `You are Jarvice AI, an intelligent assistant specialized in interview preparation and career guidance.
 You help users with:
 - Interview questions and answers
 - Resume and CV advice
@@ -178,39 +188,44 @@ You help users with:
 - Mock interview practice
 - Industry-specific guidance
 
-Be helpful, professional, and encouraging. Keep responses concise but informative.`
-          },
-          {
-            role: 'user',
-            content: message
-          }
+Be helpful, professional, and encouraging. Keep responses concise but informative.`;
+
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: OPENAI_CHAT_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: message }
         ],
         temperature: 0.7,
-        max_tokens: 1024,
-        top_p: 0.95
+        max_tokens: 1024
       },
       {
         headers: {
-          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 30000
+        timeout: 60000
       }
     );
 
-    if (response.data && response.data.choices && response.data.choices[0]) {
-      return response.data.choices[0].message.content;
-    } else {
-      throw new Error('Invalid response from OpenAI API');
+    const text = response.data?.choices?.[0]?.message?.content;
+    if (text) {
+      return text;
     }
+    throw new Error('Invalid response from OpenAI API');
   } catch (error) {
     console.error('OpenAI API error:', error.message);
+
     if (error.response?.data?.error) {
       console.error('API Error:', error.response.data.error);
+
       if (error.response.data.error.code === 'insufficient_quota') {
-        throw new Error('OpenAI quota exceeded. Please check your billing details.');
+        throw new Error('Quota exceeded. Check billing.');
       }
     }
+
     throw error;
   }
 };

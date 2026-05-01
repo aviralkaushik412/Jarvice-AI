@@ -35,16 +35,36 @@ const Chat = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  /** Each DB row is one Q&A pair; expand into user + assistant bubbles for the UI. */
+  const expandChatRows = (rows) =>
+    rows.flatMap((chat) => [
+      {
+        id: `chat-${chat.id}-user`,
+        message: chat.message,
+        response: '',
+        timestamp: chat.timestamp,
+        isUser: true
+      },
+      {
+        id: `chat-${chat.id}-bot`,
+        message: chat.message,
+        response: chat.response,
+        timestamp: chat.timestamp,
+        isUser: false
+      }
+    ]);
+
   const fetchChatHistory = async (pageNum = 1) => {
     try {
       setIsLoadingHistory(true);
       const response = await axios.get(`/api/chat/history?page=${pageNum}&limit=20`);
       const { chats, pagination } = response.data;
-      
+      const ordered = [...chats].reverse();
+
       if (pageNum === 1) {
-        setMessages(chats.reverse());
+        setMessages(expandChatRows(ordered));
       } else {
-        setMessages(prev => [...chats.reverse(), ...prev]);
+        setMessages((prev) => [...expandChatRows(ordered), ...prev]);
       }
       
       setHasMore(pagination.page < pagination.pages);

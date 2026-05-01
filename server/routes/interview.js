@@ -5,11 +5,194 @@ const fs = require('fs');
 const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const axios = require('axios');
+const { GoogleGenAI } = require('@google/genai');
 const { body, validationResult } = require('express-validator');
 const { pool } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
+
+const sanitizeQuestionString = (s) =>
+  String(s)
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/```\s*$/g, '')
+    .trim();
+
+const isQuestionJunk = (t) => {
+  const x = sanitizeQuestionString(t);
+  if (!x) return true;
+  if (/^```/.test(x)) return true;
+  if (/^[\[{}\]]$/.test(x)) return true;
+  return false;
+};
+
+/** Gemini often wraps JSON in ```json fences; never use newline-split on that output */
+const parseQuestionsFromModelText = (text) => {
+  if (!text || !String(text).trim()) return null;
+  let s = String(text).trim();
+  s = s.replace(/^```(?:json)?\s*\r?\n?/i, '');
+  s = s.replace(/\r?\n?```\s*$/i, '');
+  s = s.replace(/^```\s*\r?\n?/i, '');
+  s = s.trim();
+  const tryArray = (arr) => {
+    if (!Array.isArray(arr)) return null;
+    const out = arr
+      .map((q) =>
+        String(q)
+          .trim()
+          .replace(/^```(?:json)?\s*/i, '')
+          .replace(/```\s*$/g, '')
+          .trim()
+      )
+      .filter((q) => q.length > 0 && !/^```/.test(q) && q !== '[' && q !== ']' && q !== '{' && q !== '}');
+    return out.length ? out : null;
+  };
+  try {
+    const parsed = JSON.parse(s);
+    const got = tryArray(parsed);
+    if (got) return got;
+  } catch {
+    /* try substring between [ ] */
+  }
+  const bracket = s.match(/\[[\s\S]*\]/);
+  if (bracket) {
+    try {
+      const parsed = JSON.parse(bracket[0]);
+      const got = tryArray(parsed);
+      if (got) return got;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+};
+
+const DEFAULT_INTERVIEW_QUESTIONS = [
+  'Tell me about yourself and your experience relevant to this role.',
+  'What interests you most about this position?',
+  'Describe a challenging project you worked on and how you overcame obstacles.',
+  'How do you stay updated with the latest technologies in your field?',
+  'Where do you see yourself in 5 years?'
+];
+
+/** TEXT columns must use explicit JSON; raw JS arrays round-trip inconsistently in pg */
+const normalizeQuestionsFromDb = (raw) => {
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    return raw.map((q) => sanitizeQuestionString(q)).filter((q) => q && !isQuestionJunk(q));
+  }
+  if (typeof raw === 'string') {
+    const fromModel = parseQuestionsFromModelText(raw);
+    if (fromModel && fromModel.length) return fromModel;
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+      return [];
+    }
+    return trimmed
+      .split('\n')
+      .map((l) => l.replace(/^[\d.)\-*]+\s*/, '').trim())
+      .filter((l) => l && !isQuestionJunk(l));
+  }
+  return [];
+};
+
+const answersFromDb = (raw, minLength) => {
+  let arr = [];
+  if (Array.isArray(raw)) {
+    arr = raw.map((a) => (a == null || a === '' ? null : String(a)));
+  } else if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        arr = parsed.map((a) => (a == null || a === '' ? null : String(a)));
+      }
+    } catch {
+      arr = [];
+    }
+  }
+  while (arr.length < minLength) arr.push(null);
+  return arr;
+};
+
+const stringifyAnswersForDb = (answers) => JSON.stringify(answers);
+
+const sanitizeInterviewScore = (n) => {
+  const x = typeof n === 'number' ? n : parseInt(String(n), 10);
+  if (!Number.isFinite(x)) return 75;
+  return Math.max(1, Math.min(100, Math.round(x)));
+};
+
+const getGeminiGenerateContentUrl = () => {
+  const configured = process.env.GEMINI_API_URL;
+  if (configured) {
+    return configured.split('?')[0];
+  }
+  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+};
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+let interviewGenaiClient = null;
+const getInterviewGenAI = () => {
+  if (!GEMINI_API_KEY) return null;
+  if (!interviewGenaiClient) {
+    interviewGenaiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+  }
+  return interviewGenaiClient;
+};
+
+const geminiGenerateTextRest = async (prompt, generationConfig) => {
+  if (!GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY not configured');
+  }
+  const response = await axios.post(
+    `${getGeminiGenerateContentUrl()}?key=${GEMINI_API_KEY}`,
+    {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: generationConfig || {
+        temperature: 0.7,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 2048
+      }
+    },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 90000 }
+  );
+  const text = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text || !String(text).trim()) {
+    throw new Error('Invalid or empty REST Gemini response');
+  }
+  return String(text).trim();
+};
+
+/** Prefer @google/genai (same as chat); fall back to REST if SDK fails */
+const geminiGenerateText = async (prompt, generationConfig = {}) => {
+  const cfg = {
+    temperature: generationConfig.temperature ?? 0.7,
+    topK: generationConfig.topK ?? 40,
+    topP: generationConfig.topP ?? 0.95,
+    maxOutputTokens: generationConfig.maxOutputTokens ?? 2048
+  };
+  const ai = getInterviewGenAI();
+  if (ai) {
+    try {
+      const response = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: prompt,
+        config: cfg
+      });
+      const text = response.text && String(response.text).trim();
+      if (text) return text;
+    } catch (e) {
+      console.error('Interview Gemini SDK error:', e.message);
+    }
+  }
+  return geminiGenerateTextRest(prompt, cfg);
+};
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -90,7 +273,15 @@ router.post('/start', [
        (user_id, resume_url, resume_text, jd_text, focus_areas, difficulty, role_type) 
        VALUES ($1, $2, $3, $4, $5, $6, $7) 
        RETURNING id`,
-      [userId, resumeUrl, resumeText, jd_text, focus_areas, difficulty, role_type]
+      [
+        userId,
+        resumeUrl,
+        resumeText,
+        jd_text,
+        JSON.stringify(Array.isArray(focus_areas) ? focus_areas : []),
+        difficulty,
+        role_type
+      ]
     );
 
     const sessionId = result.rows[0].id;
@@ -99,7 +290,7 @@ router.post('/start', [
 
     await pool.query(
       'UPDATE interview_sessions SET questions_asked = $1 WHERE id = $2',
-      [questions, sessionId]
+      [JSON.stringify(questions), sessionId]
     );
 
     res.json({
@@ -133,10 +324,11 @@ router.post('/answer', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { session_id, answer, question_index } = req.body;
+    const session_id = parseInt(req.body.session_id, 10);
+    const question_index = parseInt(req.body.question_index, 10);
+    const answer = String(req.body.answer).trim();
     const userId = req.user.id;
 
-    // Get session details
     const sessionResult = await pool.query(
       'SELECT * FROM interview_sessions WHERE id = $1 AND user_id = $2',
       [session_id, userId]
@@ -147,32 +339,39 @@ router.post('/answer', [
     }
 
     const session = sessionResult.rows[0];
-    const questions = session.questions_asked || [];
-    const answers = session.answers_given || [];
+    const questions = normalizeQuestionsFromDb(session.questions_asked);
+    if (!questions.length) {
+      return res.status(400).json({ message: 'Interview has no questions' });
+    }
+    if (question_index < 0 || question_index >= questions.length) {
+      return res.status(400).json({ message: 'Invalid question index' });
+    }
 
+    const answers = answersFromDb(session.answers_given, questions.length);
     answers[question_index] = answer;
     await pool.query(
       'UPDATE interview_sessions SET answers_given = $1 WHERE id = $2',
-      [answers, session_id]
+      [stringifyAnswersForDb(answers), session_id]
     );
 
     if (question_index >= questions.length - 1) {
-      const feedback = await generateInterviewFeedback(questions, answers, session.jd_text, session.resume_text);
-      
-      const score = await calculateInterviewScore(questions, answers, session.jd_text);
+      const feedback = await generateInterviewFeedback(questions, answers);
 
+      const score = await calculateInterviewScore(questions, answers);
+
+      const safeScore = sanitizeInterviewScore(score);
       await pool.query(
         `UPDATE interview_sessions 
          SET feedback = $1, score = $2, completed_at = CURRENT_TIMESTAMP 
          WHERE id = $3`,
-        [feedback, score, session_id]
+        [feedback, safeScore, session_id]
       );
 
       return res.json({
         message: 'Interview completed!',
         completed: true,
         feedback: feedback,
-        score: score,
+        score: safeScore,
         next_question: null
       });
     }
@@ -194,6 +393,151 @@ router.post('/answer', [
   }
 });
 
+router.post('/finish-early', [
+  authenticateToken,
+  body('session_id').isInt().withMessage('Valid session ID required'),
+  body('question_index').isInt({ min: 0 }).withMessage('Valid question index required'),
+  body('current_answer').optional({ values: 'falsy' }).isString()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const session_id = parseInt(req.body.session_id, 10);
+    const question_index = parseInt(req.body.question_index, 10);
+    const current_answer = req.body.current_answer;
+    const userId = req.user.id;
+
+    if (!Number.isFinite(session_id) || !Number.isFinite(question_index)) {
+      return res.status(400).json({ message: 'Invalid session or question id' });
+    }
+
+    const r = await pool.query(
+      'SELECT * FROM interview_sessions WHERE id = $1 AND user_id = $2',
+      [session_id, userId]
+    );
+    if (r.rows.length === 0) {
+      return res.status(404).json({ message: 'Interview session not found' });
+    }
+
+    const session = r.rows[0];
+    const questions = normalizeQuestionsFromDb(session.questions_asked);
+    if (!questions.length) {
+      return res.status(400).json({ message: 'Session has no questions' });
+    }
+
+    let answers = answersFromDb(session.answers_given, questions.length);
+    const qIdx = parseInt(question_index, 10);
+    const trimmed = current_answer && String(current_answer).trim();
+    if (trimmed && qIdx >= 0 && qIdx < questions.length) {
+      answers[qIdx] = trimmed;
+    }
+
+    for (let i = 0; i < questions.length; i++) {
+      if (answers[i] == null || String(answers[i]).trim() === '') {
+        answers[i] = '[Interview ended early — no answer]';
+      }
+    }
+
+    await pool.query('UPDATE interview_sessions SET answers_given = $1 WHERE id = $2', [
+      stringifyAnswersForDb(answers),
+      session_id
+    ]);
+
+    const feedback = await generateInterviewFeedback(questions, answers);
+    const score = sanitizeInterviewScore(await calculateInterviewScore(questions, answers));
+
+    await pool.query(
+      `UPDATE interview_sessions 
+       SET feedback = $1, score = $2, completed_at = CURRENT_TIMESTAMP 
+       WHERE id = $3`,
+      [feedback, score, session_id]
+    );
+
+    return res.json({
+      message: 'Interview ended — feedback generated',
+      completed: true,
+      feedback,
+      score
+    });
+  } catch (error) {
+    console.error('Finish early error:', error);
+    res.status(500).json({
+      message: 'Failed to complete interview',
+      detail: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/** If last answer is saved but completed_at was not set (legacy bad rows), close the session */
+router.post('/finalize', [
+  authenticateToken,
+  body('session_id').isInt().withMessage('Valid session ID required')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const session_id = parseInt(req.body.session_id, 10);
+    const userId = req.user.id;
+
+    const sessionResult = await pool.query(
+      'SELECT * FROM interview_sessions WHERE id = $1 AND user_id = $2',
+      [session_id, userId]
+    );
+    if (sessionResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Interview session not found' });
+    }
+
+    const session = sessionResult.rows[0];
+    if (session.completed_at) {
+      return res.json({
+        completed: true,
+        feedback: session.feedback,
+        score: session.score
+      });
+    }
+
+    const questions = normalizeQuestionsFromDb(session.questions_asked);
+    const answers = answersFromDb(session.answers_given, questions.length);
+    const lastIdx = questions.length - 1;
+    if (lastIdx < 0) {
+      return res.status(400).json({ message: 'No questions in session' });
+    }
+
+    const lastAns = answers[lastIdx];
+    if (lastAns == null || !String(lastAns).trim()) {
+      return res.status(400).json({ message: 'Final question has no answer saved yet' });
+    }
+
+    const feedback = await generateInterviewFeedback(questions, answers);
+    const score = sanitizeInterviewScore(await calculateInterviewScore(questions, answers));
+
+    await pool.query(
+      `UPDATE interview_sessions 
+       SET feedback = $1, score = $2, completed_at = CURRENT_TIMESTAMP 
+       WHERE id = $3`,
+      [feedback, score, session_id]
+    );
+
+    return res.json({
+      completed: true,
+      feedback,
+      score
+    });
+  } catch (error) {
+    console.error('Finalize session error:', error);
+    res.status(500).json({
+      message: 'Failed to finalize interview',
+      detail: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 router.get('/history', authenticateToken, async (req, res) => {
   try {
     const { page = 1, limit = 10 } = req.query;
@@ -201,7 +545,7 @@ router.get('/history', authenticateToken, async (req, res) => {
     const userId = req.user.id;
 
     const result = await pool.query(
-      `SELECT id, jd_text, difficulty, role_type, score, created_at, completed_at,
+      `SELECT id, jd_text, difficulty, role_type, score, feedback, created_at, completed_at,
               CASE WHEN completed_at IS NOT NULL THEN true ELSE false END as is_completed
        FROM interview_sessions 
        WHERE user_id = $1 
@@ -291,13 +635,14 @@ const extractTextFromFile = async (filePath, originalName) => {
 
 const generateInterviewQuestions = async (jdText, resumeText, focusAreas, difficulty, roleType) => {
   try {
+    const areas = Array.isArray(focusAreas) ? focusAreas : [];
     const prompt = `Generate 5-8 interview questions for a ${roleType || 'software developer'} position.
     
     Job Description: ${jdText}
     
     ${resumeText ? `Candidate Resume: ${resumeText}` : ''}
     
-    Focus Areas: ${focusAreas.join(', ') || 'General technical and behavioral questions'}
+    Focus Areas: ${areas.length ? areas.join(', ') : 'General technical and behavioral questions'}
     Difficulty Level: ${difficulty}
     
     Generate a mix of:
@@ -306,151 +651,93 @@ const generateInterviewQuestions = async (jdText, resumeText, focusAreas, diffic
     - Problem-solving scenarios
     - Role-specific challenges
     
-    Return only the questions as a JSON array of strings.`;
+    Return only a JSON array of strings, with no markdown code fences or extra text.`;
 
-    const response = await axios.post(
-      `${process.env.GEMINI_API_URL}?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [{
-          parts: [{
-            text: prompt
-          }]
-        }],
-        generationConfig: {
-          temperature: 0.8,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 2048,
-        }
-      },
-      {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 30000
-      }
-    );
-
-    if (response.data && response.data.candidates && response.data.candidates[0]) {
-      const text = response.data.candidates[0].content.parts[0].text;
-      try {
-        return JSON.parse(text);
-      } catch {
-        return text.split('\n').filter(q => q.trim().length > 0);
-      }
-    } else {
-      throw new Error('Invalid response from Gemini API');
+    const text = await geminiGenerateText(prompt, {
+      temperature: 0.8,
+      topK: 40,
+      topP: 0.95,
+      maxOutputTokens: 2048
+    });
+    const parsed = parseQuestionsFromModelText(text);
+    if (parsed && parsed.length) {
+      return parsed;
     }
+    console.warn('Interview questions: could not parse model output, using defaults');
+    return [...DEFAULT_INTERVIEW_QUESTIONS];
   } catch (error) {
     console.error('Generate questions error:', error);
-    return [
-      "Tell me about yourself and your experience relevant to this role.",
-      "What interests you most about this position?",
-      "Describe a challenging project you worked on and how you overcame obstacles.",
-      "How do you stay updated with the latest technologies in your field?",
-      "Where do you see yourself in 5 years?"
-    ];
+    return [...DEFAULT_INTERVIEW_QUESTIONS];
   }
 };
 
-const generateInterviewFeedback = async (questions, answers, jdText, resumeText) => {
+const generateInterviewFeedback = async (questions, answers) => {
   try {
-    const prompt = `Provide detailed feedback for this mock interview:
+    const qaBlock = questions
+      .map((q, i) => `Q${i + 1}: ${q}\nA${i + 1}: ${answers[i] || 'No answer provided'}`)
+      .join('\n\n');
 
-    Job Description: ${jdText}
-    
-    ${resumeText ? `Candidate Resume: ${resumeText}` : ''}
-    
-    Questions and Answers:
-    ${questions.map((q, i) => `Q${i + 1}: ${q}\nA${i + 1}: ${answers[i] || 'No answer provided'}`).join('\n\n')}
-    
-    Provide feedback covering:
-    1. Overall performance assessment
-    2. Strengths demonstrated
-    3. Areas for improvement
-    4. Specific suggestions for each answer
-    5. Recommendations for interview preparation
-    6. Technical knowledge evaluation
-    7. Communication skills assessment
-    
-    Be constructive, specific, and actionable.`;
+    const prompt = `You are reviewing a mock interview. Base your feedback ONLY on the candidate's answers below (paired with each question).
 
-    const response = await axios.post(
-      `${process.env.GEMINI_API_URL}?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [{
-          parts: [{
-            text: prompt
-          }]
-        }],
-        generationConfig: {
-          temperature: 0.7,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 2048,
-        }
-      },
-      {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 30000
-      }
-    );
+Rules:
+- Do NOT use, infer, or compare against any resume, CV, portfolio, or external profile.
+- Do NOT score or judge the candidate on background, employers, or credentials not stated in the answers.
+- Evaluate only clarity, relevance to the question, depth, structure, and communication in what they actually wrote or said.
 
-    if (response.data && response.data.candidates && response.data.candidates[0]) {
-      return response.data.candidates[0].content.parts[0].text;
-    } else {
-      throw new Error('Invalid response from Gemini API');
-    }
+Questions and answers:
+${qaBlock}
+
+Provide feedback covering:
+1. Overall performance (from answers only)
+2. Strengths visible in the answers
+3. Areas for improvement
+4. Specific suggestions per answer
+5. How to prepare for similar questions (general tips)
+6. Technical depth as shown in the answers (do not assume unstated expertise)
+7. Communication quality in the answers
+
+Be constructive, specific, and actionable.`;
+
+    return await geminiGenerateText(prompt, {
+      temperature: 0.7,
+      topK: 40,
+      topP: 0.95,
+      maxOutputTokens: 2048
+    });
   } catch (error) {
     console.error('Generate feedback error:', error);
     return "Thank you for completing the interview! We'll review your responses and provide detailed feedback shortly.";
   }
 };
 
-const calculateInterviewScore = async (questions, answers, jdText) => {
+const calculateInterviewScore = async (questions, answers) => {
   try {
-    const prompt = `Rate this interview performance on a scale of 1-100:
+    const qaBlock = questions
+      .map((q, i) => `Q${i + 1}: ${q}\nA${i + 1}: ${answers[i] || 'No answer provided'}`)
+      .join('\n\n');
 
-    Job Description: ${jdText}
-    
-    Questions and Answers:
-    ${questions.map((q, i) => `Q${i + 1}: ${q}\nA${i + 1}: ${answers[i] || 'No answer provided'}`).join('\n\n')}
-    
-    Consider:
-    - Relevance of answers to questions
-    - Technical accuracy
-    - Communication clarity
-    - Problem-solving approach
-    - Professional presentation
-    
-    Return only a number between 1-100.`;
+    const prompt = `Assign a single overall score from 1 to 100 for this mock interview.
 
-    const response = await axios.post(
-      `${process.env.GEMINI_API_URL}?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [{
-          parts: [{
-            text: prompt
-          }]
-        }],
-        generationConfig: {
-          temperature: 0.3,
-          topK: 20,
-          topP: 0.8,
-          maxOutputTokens: 10,
-        }
-      },
-      {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 30000
-      }
-    );
+Rules:
+- Score ONLY from the quality of the answers below (vs the questions asked).
+- Do NOT use resume, CV, job description, or any document outside this Q&A.
+- Do not reward or penalize based on assumed background; judge only what appears in the answers.
 
-    if (response.data && response.data.candidates && response.data.candidates[0]) {
-      const text = response.data.candidates[0].content.parts[0].text;
-      const score = parseInt(text.match(/\d+/)?.[0] || '75');
-      return Math.max(1, Math.min(100, score));
-    } else {
-      return 75;
-    }
+Questions and answers:
+${qaBlock}
+
+Consider: relevance to each question, clarity, depth, structure, and reasoning in the text of the answers only.
+
+Reply with one integer from 1 to 100 and nothing else.`;
+
+    const text = await geminiGenerateText(prompt, {
+      temperature: 0.3,
+      topK: 20,
+      topP: 0.8,
+      maxOutputTokens: 32
+    });
+    const score = parseInt(String(text).match(/\d+/)?.[0] || '75', 10);
+    return Math.max(1, Math.min(100, score));
   } catch (error) {
     console.error('Calculate score error:', error);
     return 75;

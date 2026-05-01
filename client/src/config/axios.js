@@ -5,7 +5,8 @@ const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5001';
 // Create a single axios instance
 const axiosInstance = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 10000,
+  // AI + file processing (interview start, chat, etc.) often exceeds 10s
+  timeout: 120000,
   headers: {
     'Content-Type': 'application/json'
   }
@@ -17,6 +18,9 @@ axiosInstance.interceptors.request.use(
     const token = localStorage.getItem('token');
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
+    }
+    if (config.data instanceof FormData) {
+      delete config.headers['Content-Type'];
     }
     return config;
   },

@@ -1,17 +1,19 @@
 const nodemailer = require('nodemailer');
 
 const transporter = nodemailer.createTransport({
-  service: process.env.EMAIL_SERVICE || 'gmail',
+  host: process.env.EMAIL_HOST,
+  port: process.env.EMAIL_PORT,
+  secure: false,
   auth: {
     user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD
+    pass: process.env.EMAIL_PASS
   }
 });
 
 const verifyEmailTransport = async () => {
   try {
     await transporter.verify();
-    console.log('✅ Email service connected successfully');
+    console.log('Email service connected successfully');
   } catch (error) {
     console.warn('⚠️ Email service not configured:', error.message);
   }
@@ -65,9 +67,9 @@ const sendPasswordResetEmail = async (email, token) => {
 
   try {
     await transporter.sendMail(mailOptions);
-    console.log(`✅ Password reset email sent to ${email}`);
+    console.log(`Password reset email sent to ${email}`);
   } catch (error) {
-    console.error('❌ Failed to send password reset email:', error);
+    console.error('Failed to send password reset email:', error);
     throw error;
   }
 };
@@ -94,9 +96,9 @@ const sendWelcomeEmail = async (email, name) => {
 
   try {
     await transporter.sendMail(mailOptions);
-    console.log(`✅ Welcome email sent to ${email}`);
+    console.log(`Welcome email sent to ${email}`);
   } catch (error) {
-    console.error('❌ Failed to send welcome email:', error);
+    console.error('Failed to send welcome email:', error);
     throw error;
   }
 };

@@ -4,11 +4,11 @@ const { pool } = require('../config/database');
 const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-
+   
   if (!token) {
     return res.status(401).json({ message: 'Access token required' });
   }
-
+    
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
@@ -16,11 +16,11 @@ const authenticateToken = async (req, res, next) => {
       'SELECT id, name, email, subscription_status, is_verified FROM users WHERE id = $1',
       [decoded.userId]
     );
-
+    
     if (result.rows.length === 0) {
       return res.status(401).json({ message: 'User not found' });
     }
-
+    
     req.user = result.rows[0];
     next();
   } catch (error) {
@@ -28,7 +28,7 @@ const authenticateToken = async (req, res, next) => {
     return res.status(401).json({ message: 'Invalid or expired token' });
   }
 };
-
+   
 const requirePremium = (req, res, next) => {
   if (req.user.subscription_status !== 'premium') {
     return res.status(403).json({ 
@@ -38,7 +38,7 @@ const requirePremium = (req, res, next) => {
   }
   next();
 };
-
+  
 const requireVerification = (req, res, next) => {
   if (!req.user.is_verified) {
     return res.status(403).json({ 
@@ -48,7 +48,7 @@ const requireVerification = (req, res, next) => {
   }
   next();
 };
-
+    
 module.exports = {
   authenticateToken,
   requirePremium,
